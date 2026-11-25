@@ -1,0 +1,9 @@
+# Build outputs
+*.exe
+*.zip
+dist/
+
+# Local credential snapshots & user config (never commit)
+.agy-profiles/
+*.cred.json
+switcher-config.json
