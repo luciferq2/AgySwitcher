@@ -3,9 +3,11 @@ using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.IO;
 using System.Linq;
 using System.Management;
+using System.Net;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
@@ -606,6 +608,674 @@ namespace AgySwitcher
         }
     }
 
+    public class QuotaSummary
+    {
+        public bool Success { get; set; }
+        public bool IsLoading { get; set; }
+        public bool HasExhausted { get; set; }
+        public bool AllExhausted { get; set; }
+        public double? FiveHourFraction { get; set; }
+        public string FiveHourReset { get; set; }
+        public double? WeeklyFraction { get; set; }
+        public string WeeklyReset { get; set; }
+        public double? GeminiFraction { get; set; }
+        public string GeminiReset { get; set; }
+        public string Text { get; set; }
+        public string TooltipText { get; set; }
+    }
+
+    public class QuotaRingControl : Control
+    {
+        private double? _outerFraction;
+        private double? _innerFraction;
+        private bool _isLoading;
+        private bool _hasError;
+        private bool _isActiveCard;
+        private readonly float _scale;
+
+        public QuotaRingControl(float dpiScale)
+        {
+            _scale = Math.Max(1.0f, dpiScale);
+            SetStyle(
+                ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.UserPaint |
+                ControlStyles.OptimizedDoubleBuffer |
+                ControlStyles.ResizeRedraw |
+                ControlStyles.SupportsTransparentBackColor,
+                true);
+            BackColor = Color.Transparent;
+            Size = new Size((int)Math.Round(56 * _scale), (int)Math.Round(56 * _scale));
+            Cursor = Cursors.Hand;
+        }
+
+        public void SetState(QuotaSummary summary, bool isActiveCard)
+        {
+            _isActiveCard = isActiveCard;
+            if (summary == null)
+            {
+                _isLoading = false;
+                _hasError = false;
+                _outerFraction = null;
+                _innerFraction = null;
+            }
+            else if (summary.IsLoading)
+            {
+                _isLoading = true;
+                _hasError = false;
+                _outerFraction = null;
+                _innerFraction = null;
+            }
+            else if (!summary.Success)
+            {
+                _isLoading = false;
+                _hasError = true;
+                _outerFraction = null;
+                _innerFraction = null;
+            }
+            else
+            {
+                _isLoading = false;
+                _hasError = false;
+                // Outer ring = Gemini 5h, Inner ring = Gemini weekly (Claude not shown on rings)
+                _outerFraction = summary.GeminiFraction ?? summary.FiveHourFraction;
+                _innerFraction = summary.WeeklyFraction;
+            }
+            Invalidate();
+        }
+
+        private static Color GetRingColor(double frac, Color normalColor)
+        {
+            if (frac <= 0.005) return Color.FromArgb(239, 68, 68);   // Red
+            if (frac <= 0.30) return Color.FromArgb(245, 158, 11);   // Amber
+            return normalColor;
+        }
+
+        private void DrawRing(Graphics g, RectangleF rect, float strokeWidth, double? fraction, Color normalColor, Color trackColor)
+        {
+            using (var trackPen = new Pen(trackColor, strokeWidth))
+            {
+                trackPen.StartCap = LineCap.Round;
+                trackPen.EndCap = LineCap.Round;
+                g.DrawEllipse(trackPen, rect);
+            }
+
+            if (!fraction.HasValue) return;
+
+            double clamped = Math.Max(0.0, Math.Min(1.0, fraction.Value));
+            if (clamped <= 0.005)
+            {
+                // Draw subtle red ring indicator when 0%
+                using (var zeroPen = new Pen(Color.FromArgb(120, 239, 68, 68), strokeWidth))
+                {
+                    g.DrawEllipse(zeroPen, rect);
+                }
+                return;
+            }
+
+            Color arcColor = GetRingColor(clamped, normalColor);
+            using (var arcPen = new Pen(arcColor, strokeWidth))
+            {
+                arcPen.StartCap = LineCap.Round;
+                arcPen.EndCap = LineCap.Round;
+                if (clamped >= 0.995)
+                {
+                    g.DrawEllipse(arcPen, rect);
+                }
+                else
+                {
+                    float radius = rect.Width / 2f;
+                    // Compensate for round caps so small gaps (like 97%) remain clearly visible
+                    float capDeg = radius > 1f ? (float)((strokeWidth / radius) * (180.0 / Math.PI)) : 0f;
+                    float rawSweep = (float)(360.0 * clamped);
+                    float sweep = Math.Max(4f, Math.Min(rawSweep, 360f - capDeg - 4f));
+                    g.DrawArc(arcPen, rect, -90f, sweep);
+                }
+            }
+        }
+
+        private static void DrawSparkle(Graphics g, float cx, float cy, float radius, Color color)
+        {
+            float ctrl = radius * 0.22f;
+            using (var path = new GraphicsPath())
+            {
+                path.AddBezier(cx, cy - radius, cx + ctrl, cy - ctrl, cx + ctrl, cy - ctrl, cx + radius, cy);
+                path.AddBezier(cx + radius, cy, cx + ctrl, cy + ctrl, cx + ctrl, cy + ctrl, cx, cy + radius);
+                path.AddBezier(cx, cy + radius, cx - ctrl, cy + ctrl, cx - ctrl, cy + ctrl, cx - radius, cy);
+                path.AddBezier(cx - radius, cy, cx - ctrl, cy - ctrl, cx - ctrl, cy - ctrl, cx, cy - radius);
+                path.CloseFigure();
+
+                using (var brush = new SolidBrush(color))
+                {
+                    g.FillPath(brush, path);
+                }
+            }
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            var g = e.Graphics;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            float size = Math.Min(Width, Height);
+            float cx = Width / 2f;
+            float cy = Height / 2f;
+
+            float outerStroke = 4.2f * _scale;
+            float innerStroke = 3.4f * _scale;
+            float outerRadius = (size / 2f) - outerStroke * 0.85f - 2f * _scale;
+            float innerRadius = outerRadius - outerStroke - 3.6f * _scale;
+
+            Color trackColor = _isActiveCard
+                ? Color.FromArgb(214, 226, 245)
+                : Color.FromArgb(229, 234, 241);
+
+            if (_hasError)
+            {
+                trackColor = Color.FromArgb(254, 226, 226);
+            }
+
+            var outerRect = new RectangleF(cx - outerRadius, cy - outerRadius, outerRadius * 2f, outerRadius * 2f);
+            var innerRect = new RectangleF(cx - innerRadius, cy - innerRadius, innerRadius * 2f, innerRadius * 2f);
+
+            Color outerNormal = Color.FromArgb(34, 197, 94);   // Emerald Green (5h)
+            Color innerNormal = Color.FromArgb(14, 165, 233);  // Sky Blue (Weekly)
+
+            DrawRing(g, outerRect, outerStroke, _outerFraction, outerNormal, trackColor);
+            DrawRing(g, innerRect, innerStroke, _innerFraction, innerNormal, trackColor);
+
+            Color starColor = _isLoading
+                ? Color.FromArgb(167, 139, 250)
+                : (_hasError
+                    ? Color.FromArgb(239, 68, 68)
+                    : Color.FromArgb(139, 92, 246));
+
+            float starRadius = Math.Max(6f * _scale, innerRadius * 0.56f);
+            DrawSparkle(g, cx, cy, starRadius, starColor);
+        }
+    }
+
+    internal static class QuotaHelper
+    {
+        private class OAuthClientPair
+        {
+            public string ClientId;
+            public string ClientSecret;
+        }
+
+        private static readonly object OAuthLock = new object();
+        private static List<OAuthClientPair> _cachedClients;
+
+        static QuotaHelper()
+        {
+            try
+            {
+                // Enable TLS 1.2 on .NET Framework 4.x
+                ServicePointManager.SecurityProtocol |= (SecurityProtocolType)3072;
+            }
+            catch { }
+        }
+
+        private static string FindAgyExe()
+        {
+            string local = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "agy", "bin", "agy.exe");
+            if (File.Exists(local)) return local;
+
+            string pathEnv = Environment.GetEnvironmentVariable("PATH") ?? "";
+            foreach (string dir in pathEnv.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                try
+                {
+                    string candidate = Path.Combine(dir.Trim(), "agy.exe");
+                    if (File.Exists(candidate)) return candidate;
+                }
+                catch { }
+            }
+            return null;
+        }
+
+        private static List<OAuthClientPair> GetOAuthClients()
+        {
+            lock (OAuthLock)
+            {
+                if (_cachedClients != null) return _cachedClients;
+                var pairs = new List<OAuthClientPair>();
+                try
+                {
+                    string agyExe = FindAgyExe();
+                    if (!string.IsNullOrEmpty(agyExe) && File.Exists(agyExe))
+                    {
+                        byte[] bytes = File.ReadAllBytes(agyExe);
+                        string text = Encoding.ASCII.GetString(bytes);
+
+                        var cids = new List<string>();
+                        foreach (Match m in Regex.Matches(text, @"[0-9]{10,15}-[a-z0-9]{20,40}\.apps\.googleusercontent\.com"))
+                        {
+                            if (!cids.Contains(m.Value)) cids.Add(m.Value);
+                        }
+                        // Prioritize known Antigravity client id first
+                        cids = cids
+                            .OrderByDescending(c => c.StartsWith("1071006060591-", StringComparison.Ordinal))
+                            .ToList();
+
+                        var secs = new List<string>();
+                        foreach (Match m in Regex.Matches(text, @"GOCSPX-[A-Za-z0-9_\-]{28}"))
+                        {
+                            if (!secs.Contains(m.Value)) secs.Add(m.Value);
+                        }
+
+                        foreach (string cid in cids)
+                        {
+                            foreach (string sec in secs)
+                            {
+                                pairs.Add(new OAuthClientPair { ClientId = cid, ClientSecret = sec });
+                            }
+                        }
+                    }
+                }
+                catch { }
+                _cachedClients = pairs;
+                return _cachedClients;
+            }
+        }
+
+        private static string HttpPostJson(string url, string bearerToken, string jsonBody, out int statusCode)
+        {
+            statusCode = 0;
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "POST";
+            req.Timeout = 10000;
+            req.ReadWriteTimeout = 10000;
+            req.ContentType = "application/json";
+            req.UserAgent = "antigravity/2.35.2 windows/amd64";
+            if (!string.IsNullOrEmpty(bearerToken))
+            {
+                req.Headers["Authorization"] = "Bearer " + bearerToken;
+            }
+            byte[] data = Encoding.UTF8.GetBytes(jsonBody ?? "{}");
+            req.ContentLength = data.Length;
+            using (var stream = req.GetRequestStream())
+            {
+                stream.Write(data, 0, data.Length);
+            }
+            try
+            {
+                using (var resp = (HttpWebResponse)req.GetResponse())
+                {
+                    statusCode = (int)resp.StatusCode;
+                    using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        return reader.ReadToEnd();
+                    }
+                }
+            }
+            catch (WebException wex)
+            {
+                var errResp = wex.Response as HttpWebResponse;
+                if (errResp != null)
+                {
+                    statusCode = (int)errResp.StatusCode;
+                }
+                throw;
+            }
+        }
+
+        private static string RefreshAccessToken(string refreshToken, out string error)
+        {
+            error = null;
+            if (string.IsNullOrEmpty(refreshToken))
+            {
+                error = "缺少 refresh_token";
+                return null;
+            }
+
+            var clients = GetOAuthClients();
+            if (clients.Count == 0)
+            {
+                error = "未找到 agy.exe 以获取 OAuth 客户端参数";
+                return null;
+            }
+
+            foreach (var pair in clients)
+            {
+                try
+                {
+                    string form = string.Format(
+                        "client_id={0}&client_secret={1}&refresh_token={2}&grant_type=refresh_token",
+                        Uri.EscapeDataString(pair.ClientId),
+                        Uri.EscapeDataString(pair.ClientSecret),
+                        Uri.EscapeDataString(refreshToken));
+                    var req = (HttpWebRequest)WebRequest.Create("https://oauth2.googleapis.com/token");
+                    req.Method = "POST";
+                    req.Timeout = 8000;
+                    req.ContentType = "application/x-www-form-urlencoded";
+                    byte[] bodyBytes = Encoding.ASCII.GetBytes(form);
+                    req.ContentLength = bodyBytes.Length;
+                    using (var s = req.GetRequestStream())
+                    {
+                        s.Write(bodyBytes, 0, bodyBytes.Length);
+                    }
+                    using (var resp = (HttpWebResponse)req.GetResponse())
+                    using (var reader = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+                    {
+                        var dict = SwitcherCore.Json.DeserializeObject(reader.ReadToEnd()) as Dictionary<string, object>;
+                        if (dict != null && dict.ContainsKey("access_token"))
+                        {
+                            string tok = dict["access_token"] as string;
+                            if (!string.IsNullOrEmpty(tok))
+                            {
+                                // Keep working pair first for subsequent calls
+                                lock (OAuthLock)
+                                {
+                                    _cachedClients = new List<OAuthClientPair> { pair };
+                                }
+                                return tok;
+                            }
+                        }
+                    }
+                }
+                catch (WebException wex)
+                {
+                    var errResp = wex.Response as HttpWebResponse;
+                    if (errResp != null && (int)errResp.StatusCode == 400)
+                    {
+                        error = "refresh_token 已失效";
+                    }
+                }
+                catch { }
+            }
+
+            if (error == null) error = "Token 刷新失败";
+            return null;
+        }
+
+        private static string FormatResetTime(string isoUtc)
+        {
+            if (string.IsNullOrEmpty(isoUtc)) return "";
+            DateTime dt;
+            if (DateTime.TryParse(isoUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out dt))
+            {
+                DateTime local = dt.ToLocalTime();
+                if (local.Date == DateTime.Now.Date)
+                {
+                    return local.ToString("HH:mm");
+                }
+                return local.ToString("MM-dd HH:mm");
+            }
+            return "";
+        }
+
+        private static string FormatGroup(string label, double? minFrac, string resetIso)
+        {
+            if (!minFrac.HasValue) return null;
+            int pct = (int)Math.Round(Math.Max(0.0, Math.Min(1.0, minFrac.Value)) * 100.0);
+            string reset = FormatResetTime(resetIso);
+            string status = pct <= 0 ? "0% 已耗尽" : pct + "%";
+            if (!string.IsNullOrEmpty(reset))
+            {
+                return string.Format("{0} {1} ({2}重置)", label, status, reset);
+            }
+            return string.Format("{0} {1}", label, status);
+        }
+
+        public static QuotaSummary FetchProfileQuota(CredProfile profile)
+        {
+            try
+            {
+                if (profile == null || string.IsNullOrEmpty(profile.EncryptedBlob))
+                {
+                    return new QuotaSummary { Success = false, Text = "额度：无凭证数据" };
+                }
+
+                byte[] raw = ProtectedData.Unprotect(
+                    Convert.FromBase64String(profile.EncryptedBlob),
+                    null,
+                    DataProtectionScope.CurrentUser);
+                string jsonText = Encoding.UTF8.GetString(raw);
+                var root = SwitcherCore.Json.DeserializeObject(jsonText) as Dictionary<string, object>;
+                if (root == null || !root.ContainsKey("token"))
+                {
+                    return new QuotaSummary { Success = false, Text = "额度：未识别的凭证格式" };
+                }
+
+                var tokenObj = root["token"] as Dictionary<string, object>;
+                if (tokenObj == null)
+                {
+                    return new QuotaSummary { Success = false, Text = "额度：Token 字段为空" };
+                }
+
+                string accessToken = tokenObj.ContainsKey("access_token") ? tokenObj["access_token"] as string : null;
+                string refreshToken = tokenObj.ContainsKey("refresh_token") ? tokenObj["refresh_token"] as string : null;
+                string expiryStr = tokenObj.ContainsKey("expiry") ? tokenObj["expiry"] as string : null;
+
+                bool needRefresh = string.IsNullOrEmpty(accessToken);
+                if (!needRefresh && !string.IsNullOrEmpty(expiryStr))
+                {
+                    DateTime exp;
+                    if (DateTime.TryParse(expiryStr, null, System.Globalization.DateTimeStyles.RoundtripKind, out exp))
+                    {
+                        if (DateTime.UtcNow.AddMinutes(2) >= exp.ToUniversalTime())
+                        {
+                            needRefresh = true;
+                        }
+                    }
+                }
+
+                if (needRefresh)
+                {
+                    string err;
+                    string refreshed = RefreshAccessToken(refreshToken, out err);
+                    if (string.IsNullOrEmpty(refreshed))
+                    {
+                        return new QuotaSummary { Success = false, Text = "额度：" + (err ?? "刷新失败") };
+                    }
+                    accessToken = refreshed;
+                }
+
+                string summaryText = null;
+                int code;
+                try
+                {
+                    summaryText = HttpPostJson(
+                        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                        accessToken,
+                        "{\"project\":\"aicode-consumers\"}",
+                        out code);
+                }
+                catch (WebException)
+                {
+                    string err;
+                    string refreshed = RefreshAccessToken(refreshToken, out err);
+                    if (string.IsNullOrEmpty(refreshed))
+                    {
+                        return new QuotaSummary { Success = false, Text = "额度：查询失败（请检查网络/代理）" };
+                    }
+                    accessToken = refreshed;
+                    summaryText = HttpPostJson(
+                        "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
+                        accessToken,
+                        "{\"project\":\"aicode-consumers\"}",
+                        out code);
+                }
+
+                double? gem5h = null;
+                string gem5hReset = null;
+                double? gemWeek = null;
+                string gemWeekReset = null;
+                double? claude5h = null;
+                string claude5hReset = null;
+                double? claudeWeek = null;
+                string claudeWeekReset = null;
+
+                var summaryDict = SwitcherCore.Json.DeserializeObject(summaryText) as Dictionary<string, object>;
+                if (summaryDict != null && summaryDict.ContainsKey("groups"))
+                {
+                    var groups = summaryDict["groups"] as object[];
+                    if (groups != null)
+                    {
+                        foreach (var gObj in groups)
+                        {
+                            var gDict = gObj as Dictionary<string, object>;
+                            if (gDict == null || !gDict.ContainsKey("buckets")) continue;
+                            string gName = gDict.ContainsKey("displayName") ? (gDict["displayName"] as string ?? "") : "";
+                            bool isGeminiGroup = gName.IndexOf("Gemini", StringComparison.OrdinalIgnoreCase) >= 0;
+                            bool isClaudeGroup = gName.IndexOf("Claude", StringComparison.OrdinalIgnoreCase) >= 0;
+
+                            var buckets = gDict["buckets"] as object[];
+                            if (buckets == null) continue;
+                            foreach (var bObj in buckets)
+                            {
+                                var bDict = bObj as Dictionary<string, object>;
+                                if (bDict == null) continue;
+                                string bucketId = bDict.ContainsKey("bucketId") ? (bDict["bucketId"] as string ?? "") : "";
+                                string win = bDict.ContainsKey("window") ? (bDict["window"] as string ?? "") : "";
+                                if (!bDict.ContainsKey("remainingFraction") || bDict["remainingFraction"] == null) continue;
+                                double frac = Convert.ToDouble(bDict["remainingFraction"]);
+                                string reset = bDict.ContainsKey("resetTime") ? bDict["resetTime"] as string : null;
+
+                                bool isGem = isGeminiGroup || bucketId.StartsWith("gemini-", StringComparison.OrdinalIgnoreCase);
+                                bool is3p = isClaudeGroup || bucketId.StartsWith("3p-", StringComparison.OrdinalIgnoreCase);
+
+                                if (isGem)
+                                {
+                                    if (string.Equals(win, "5h", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        gem5h = frac; gem5hReset = reset;
+                                    }
+                                    else if (string.Equals(win, "weekly", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        gemWeek = frac; gemWeekReset = reset;
+                                    }
+                                }
+                                else if (is3p)
+                                {
+                                    if (string.Equals(win, "5h", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        claude5h = frac; claude5hReset = reset;
+                                    }
+                                    else if (string.Equals(win, "weekly", StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        claudeWeek = frac; claudeWeekReset = reset;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fallback to fetchAvailableModels if Gemini 5h not present in summary
+                if (!gem5h.HasValue)
+                {
+                    try
+                    {
+                        int mCode;
+                        string respText = HttpPostJson(
+                            "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
+                            accessToken,
+                            "{}",
+                            out mCode);
+                        var respDict = SwitcherCore.Json.DeserializeObject(respText) as Dictionary<string, object>;
+                        var models = (respDict != null && respDict.ContainsKey("models"))
+                            ? respDict["models"] as Dictionary<string, object>
+                            : null;
+                        if (models != null)
+                        {
+                            foreach (var kv in models)
+                            {
+                                string modelId = kv.Key ?? "";
+                                if (modelId.StartsWith("tab_", StringComparison.OrdinalIgnoreCase)) continue;
+                                if (modelId.IndexOf("gemini", StringComparison.OrdinalIgnoreCase) < 0) continue;
+                                var mDict = kv.Value as Dictionary<string, object>;
+                                var qDict = (mDict != null && mDict.ContainsKey("quotaInfo")) ? mDict["quotaInfo"] as Dictionary<string, object> : null;
+                                if (qDict == null || !qDict.ContainsKey("remainingFraction") || qDict["remainingFraction"] == null) continue;
+                                double frac = Convert.ToDouble(qDict["remainingFraction"]);
+                                string reset = qDict.ContainsKey("resetTime") ? qDict["resetTime"] as string : null;
+                                if (!gem5h.HasValue || frac < gem5h.Value)
+                                {
+                                    gem5h = frac;
+                                    gem5hReset = reset;
+                                }
+                            }
+                        }
+                    }
+                    catch { }
+                }
+
+                Func<double?, string, string> fmtVal = (v, resetIso) =>
+                {
+                    if (!v.HasValue) return "--";
+                    int p = (int)Math.Round(Math.Max(0.0, Math.Min(1.0, v.Value)) * 100.0);
+                    string r = FormatResetTime(resetIso);
+                    if (!string.IsNullOrEmpty(r))
+                    {
+                        // For weekly reset like "12-03 15:29", keep compact "12-03" in main line if space matters
+                        if (r.Length > 5 && r.IndexOf(' ') > 0) r = r.Substring(0, r.IndexOf(' '));
+                        return p + "%(" + r + ")";
+                    }
+                    return p + "%";
+                };
+
+                var lineParts = new List<string>();
+                if (gem5h.HasValue || gemWeek.HasValue)
+                {
+                    lineParts.Add(string.Format("G: {0} · 周{1}", fmtVal(gem5h, gem5hReset), fmtVal(gemWeek, gemWeekReset)));
+                }
+                if (claude5h.HasValue || claudeWeek.HasValue)
+                {
+                    lineParts.Add(string.Format("C: {0} · {1}", fmtVal(claude5h, claude5hReset), fmtVal(claudeWeek, claudeWeekReset)));
+                }
+
+                if (lineParts.Count == 0)
+                {
+                    return new QuotaSummary { Success = true, Text = "暂无可统计额度" };
+                }
+
+                var tips = new List<string>();
+                if (gem5h.HasValue) tips.Add("Gemini 5h (外环): " + FormatGroup("", gem5h, gem5hReset).Trim());
+                if (gemWeek.HasValue) tips.Add("Gemini 周 (内环): " + FormatGroup("", gemWeek, gemWeekReset).Trim());
+                if (claude5h.HasValue) tips.Add("Claude 5h: " + FormatGroup("", claude5h, claude5hReset).Trim());
+                if (claudeWeek.HasValue) tips.Add("Claude 周: " + FormatGroup("", claudeWeek, claudeWeekReset).Trim());
+
+                bool g5Zero = gem5h.HasValue && gem5h.Value <= 0.005;
+                bool gwZero = gemWeek.HasValue && gemWeek.Value <= 0.005;
+                bool c5Zero = claude5h.HasValue && claude5h.Value <= 0.005;
+                bool cwZero = claudeWeek.HasValue && claudeWeek.Value <= 0.005;
+                bool anyZero = g5Zero || gwZero || c5Zero || cwZero;
+                bool allZero = (!gem5h.HasValue || g5Zero) && (!gemWeek.HasValue || gwZero) && (!claude5h.HasValue || c5Zero) && (!claudeWeek.HasValue || cwZero);
+
+                return new QuotaSummary
+                {
+                    Success = true,
+                    HasExhausted = anyZero,
+                    AllExhausted = allZero,
+                    GeminiFraction = gem5h,
+                    GeminiReset = gem5hReset,
+                    FiveHourFraction = gem5h,
+                    FiveHourReset = gem5hReset,
+                    WeeklyFraction = gemWeek,
+                    WeeklyReset = gemWeekReset,
+                    Text = string.Join("  |  ", lineParts.ToArray()),
+                    TooltipText = string.Join("\n", tips.ToArray())
+                };
+            }
+            catch (Exception ex)
+            {
+                return new QuotaSummary { Success = false, Text = "额度：查询异常 (" + ex.Message + ")" };
+            }
+        }
+    }
+
+    internal class BufferedFlowLayoutPanel : FlowLayoutPanel
+    {
+        public BufferedFlowLayoutPanel()
+        {
+            DoubleBuffered = true;
+        }
+    }
+
     public class MainForm : Form
     {
         private static readonly Color PrimaryBlue = Color.FromArgb(26, 115, 232);
@@ -624,9 +1294,16 @@ namespace AgySwitcher
         private TextBox _txtNewRemark;
         private Label _lblFooter;
         private System.Windows.Forms.Timer _statusTimer;
+        private System.Windows.Forms.Timer _resizeTimer;
+        private Button _btnRefreshQuota;
+        private int _quotaRefreshingCount;
+        private readonly Dictionary<string, QuotaSummary> _quotaCache =
+            new Dictionary<string, QuotaSummary>(StringComparer.OrdinalIgnoreCase);
+        private readonly ToolTip _quotaToolTip = new ToolTip();
 
         public MainForm()
         {
+            DoubleBuffered = true;
             using (Graphics g = CreateGraphics())
             {
                 _dpiScale = Math.Max(1.0f, g.DpiX / 96.0f);
@@ -635,8 +1312,8 @@ namespace AgySwitcher
             AutoScaleMode = AutoScaleMode.Dpi;
             Text = "Antigravity 账号切换器";
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
-            ClientSize = new Size(S(560), S(540));
-            MinimumSize = new Size(S(480), S(440));
+            ClientSize = new Size(S(660), S(560));
+            MinimumSize = new Size(S(560), S(450));
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Microsoft YaHei UI", 9.5F);
             BackColor = BgCanvas;
@@ -646,11 +1323,28 @@ namespace AgySwitcher
             RefreshProfiles();
             UpdateProcessStatus();
 
-            Resize += (s, e) => AdjustCardWidths();
+            _resizeTimer = new System.Windows.Forms.Timer { Interval = 35 };
+            _resizeTimer.Tick += (s, e) =>
+            {
+                _resizeTimer.Stop();
+                AdjustCardWidths();
+            };
+            Resize += (s, e) =>
+            {
+                _resizeTimer.Stop();
+                _resizeTimer.Start();
+            };
+            ResizeEnd += (s, e) =>
+            {
+                _resizeTimer.Stop();
+                AdjustCardWidths();
+            };
 
             _statusTimer = new System.Windows.Forms.Timer { Interval = 2500 };
             _statusTimer.Tick += (s, e) => UpdateProcessStatus();
             _statusTimer.Start();
+
+            Shown += (s, e) => RefreshAllQuotasAsync();
         }
 
         private int S(int px)
@@ -779,16 +1473,18 @@ namespace AgySwitcher
                 SetFooter("已尝试关闭 Antigravity 进程。", false);
             });
             var btnShortcut = MakeButton("生成一键快捷方式", false, (s, e) => CreateQuickSwitchShortcuts());
+            _btnRefreshQuota = MakeButton("刷新额度", false, (s, e) => RefreshAllQuotasAsync());
 
             actionRow.Controls.Add(btnNext);
             actionRow.Controls.Add(_btnKillApp);
             actionRow.Controls.Add(btnShortcut);
+            actionRow.Controls.Add(_btnRefreshQuota);
 
             topHeader.Controls.Add(statusRow, 0, 0);
             topHeader.Controls.Add(actionRow, 0, 1);
 
             // Middle scrollable list
-            _profilePanel = new FlowLayoutPanel
+            _profilePanel = new BufferedFlowLayoutPanel
             {
                 Dock = DockStyle.Fill,
                 AutoScroll = true,
@@ -1012,15 +1708,20 @@ namespace AgySwitcher
         private void AdjustCardWidths()
         {
             int cardWidth = GetCardWidth();
+            _profilePanel.SuspendLayout();
             foreach (Control c in _profilePanel.Controls)
             {
                 if (c is Panel)
                 {
-                    c.MinimumSize = new Size(cardWidth, 0);
-                    c.MaximumSize = new Size(cardWidth, 0);
-                    c.Width = cardWidth;
+                    if (c.Width != cardWidth)
+                    {
+                        c.MinimumSize = new Size(cardWidth, 0);
+                        c.MaximumSize = new Size(cardWidth, 0);
+                        c.Width = cardWidth;
+                    }
                 }
             }
+            _profilePanel.ResumeLayout(true);
         }
 
         private void RefreshProfiles()
@@ -1079,6 +1780,7 @@ namespace AgySwitcher
                         MaximumSize = new Size(cardWidth, 0),
                         AutoSize = true,
                         AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                        Padding = new Padding(1),
                         BackColor = isCurrent ? ActiveCardBg : Color.White,
                         Margin = new Padding(0, 0, 0, S(10))
                     };
@@ -1096,25 +1798,31 @@ namespace AgySwitcher
                         Dock = DockStyle.Top,
                         AutoSize = true,
                         AutoSizeMode = AutoSizeMode.GrowAndShrink,
-                        ColumnCount = 2,
+                        ColumnCount = 3,
                         RowCount = 1,
-                        Padding = new Padding(S(12), S(10), S(12), S(10)),
+                        Padding = new Padding(S(12), S(10), S(12), S(12)),
                         Margin = Padding.Empty,
                         BackColor = Color.Transparent
                     };
+                    inner.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
                     inner.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
                     inner.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+                    inner.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
                     var textStack = new TableLayoutPanel
                     {
-                        Dock = DockStyle.Fill,
+                        Dock = DockStyle.Top,
                         AutoSize = true,
                         AutoSizeMode = AutoSizeMode.GrowAndShrink,
                         ColumnCount = 1,
-                        RowCount = 3,
+                        RowCount = 4,
                         Margin = Padding.Empty
                     };
                     textStack.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+                    textStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                    textStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                    textStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                    textStack.RowStyles.Add(new RowStyle(SizeType.AutoSize));
 
                     string titleText = (isCurrent ? "当前 · " : "") + displayTitle;
                     var lblTitle = new Label
@@ -1123,7 +1831,7 @@ namespace AgySwitcher
                         Font = new Font("Microsoft YaHei UI", 10.5F, FontStyle.Bold),
                         ForeColor = isCurrent ? PrimaryBlue : Color.FromArgb(30, 41, 59),
                         AutoSize = true,
-                        Margin = new Padding(0, 0, 0, S(3))
+                        Margin = new Padding(0, 0, 0, S(2))
                     };
                     var lblEmail = new Label
                     {
@@ -1133,18 +1841,66 @@ namespace AgySwitcher
                         AutoSize = true,
                         Margin = new Padding(0, 0, 0, S(3))
                     };
+
+                    QuotaSummary qSummary;
+                    _quotaCache.TryGetValue(name, out qSummary);
+                    string quotaText = qSummary != null ? qSummary.Text : "点击「刷新额度」查看 5h 与周额度";
+                    Color quotaColor = Color.FromArgb(100, 116, 139);
+                    if (qSummary != null && !qSummary.IsLoading)
+                    {
+                        if (!qSummary.Success)
+                        {
+                            quotaColor = Color.FromArgb(180, 83, 9);
+                        }
+                        else if (qSummary.AllExhausted)
+                        {
+                            quotaColor = Color.FromArgb(220, 38, 38);
+                        }
+                        else if (qSummary.HasExhausted)
+                        {
+                            quotaColor = Color.FromArgb(217, 119, 6);
+                        }
+                        else
+                        {
+                            quotaColor = Color.FromArgb(22, 163, 74);
+                        }
+                    }
+
+                    var lblQuota = new Label
+                    {
+                        Text = quotaText,
+                        ForeColor = quotaColor,
+                        Font = new Font("Microsoft YaHei UI", 8.5F, (qSummary != null && qSummary.HasExhausted) ? FontStyle.Bold : FontStyle.Regular),
+                        AutoSize = true,
+                        AutoEllipsis = true,
+                        Margin = new Padding(0, 0, 0, S(3))
+                    };
+
                     var lblMeta = new Label
                     {
                         Text = metaLine,
                         ForeColor = Color.FromArgb(148, 163, 184),
-                        Font = new Font("Microsoft YaHei UI", 8.25F),
+                        Font = new Font("Microsoft YaHei UI", 8F),
                         AutoSize = true,
                         Margin = Padding.Empty
                     };
 
                     textStack.Controls.Add(lblTitle, 0, 0);
                     textStack.Controls.Add(lblEmail, 0, 1);
-                    textStack.Controls.Add(lblMeta, 0, 2);
+                    textStack.Controls.Add(lblQuota, 0, 2);
+                    textStack.Controls.Add(lblMeta, 0, 3);
+
+                    var ring = new QuotaRingControl(_dpiScale)
+                    {
+                        Anchor = AnchorStyles.Left,
+                        Margin = new Padding(0, 0, S(12), 0)
+                    };
+                    ring.SetState(qSummary, isCurrent);
+                    string tip = (qSummary != null && !string.IsNullOrEmpty(qSummary.TooltipText))
+                        ? qSummary.TooltipText
+                        : "外环：5h 额度  |  内环：周额度\n点击顶部「刷新额度」更新";
+                    _quotaToolTip.SetToolTip(ring, tip);
+                    _quotaToolTip.SetToolTip(lblQuota, tip);
 
                     string targetFile = file;
                     string profileName = name;
@@ -1165,8 +1921,9 @@ namespace AgySwitcher
                     btnBox.Controls.Add(btnEdit);
                     btnBox.Controls.Add(btnSwitch);
 
-                    inner.Controls.Add(textStack, 0, 0);
-                    inner.Controls.Add(btnBox, 1, 0);
+                    inner.Controls.Add(ring, 0, 0);
+                    inner.Controls.Add(textStack, 1, 0);
+                    inner.Controls.Add(btnBox, 2, 0);
                     card.Controls.Add(inner);
                     _profilePanel.Controls.Add(card);
                 }
@@ -1345,6 +2102,73 @@ namespace AgySwitcher
         {
             _lblFooter.Text = msg;
             _lblFooter.ForeColor = isError ? Color.Crimson : Color.FromArgb(22, 163, 74);
+        }
+
+        private void RefreshAllQuotasAsync()
+        {
+            if (_quotaRefreshingCount > 0) return;
+
+            var names = SwitcherCore.GetSortedProfileNames();
+            if (names.Count == 0)
+            {
+                SetFooter("暂无可查询的账号快照。", false);
+                return;
+            }
+
+            _quotaRefreshingCount = names.Count;
+            if (_btnRefreshQuota != null)
+            {
+                _btnRefreshQuota.Enabled = false;
+                _btnRefreshQuota.Text = "查询中...";
+            }
+            SetFooter("正在并发查询各账号额度...", false);
+
+            foreach (var name in names)
+            {
+                _quotaCache[name] = new QuotaSummary { IsLoading = true, Text = "额度：查询中..." };
+            }
+            RefreshProfiles();
+
+            foreach (var name in names)
+            {
+                string profileName = name;
+                ThreadPool.QueueUserWorkItem(_ =>
+                {
+                    QuotaSummary result;
+                    try
+                    {
+                        string file = SwitcherCore.GetProfileFilePath(profileName);
+                        var data = SwitcherCore.Json.Deserialize<CredProfile>(File.ReadAllText(file, Encoding.UTF8));
+                        result = QuotaHelper.FetchProfileQuota(data);
+                    }
+                    catch (Exception ex)
+                    {
+                        result = new QuotaSummary { Success = false, Text = "额度：读取失败 (" + ex.Message + ")" };
+                    }
+
+                    if (IsDisposed || !IsHandleCreated) return;
+                    try
+                    {
+                        BeginInvoke((Action)(() =>
+                        {
+                            if (IsDisposed) return;
+                            _quotaCache[profileName] = result;
+                            _quotaRefreshingCount = Math.Max(0, _quotaRefreshingCount - 1);
+                            RefreshProfiles();
+                            if (_quotaRefreshingCount == 0)
+                            {
+                                if (_btnRefreshQuota != null)
+                                {
+                                    _btnRefreshQuota.Enabled = true;
+                                    _btnRefreshQuota.Text = "刷新额度";
+                                }
+                                SetFooter("已完成所有账号额度查询。", false);
+                            }
+                        }));
+                    }
+                    catch { }
+                });
+            }
         }
     }
 
